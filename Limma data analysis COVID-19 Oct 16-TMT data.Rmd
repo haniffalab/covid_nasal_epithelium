@@ -1,0 +1,811 @@
+---
+title: "COVID-19 Proteomics 6 donors: 6 Adults  samples"
+author: "MED"
+date: "16 Oct 2020"
+output: html_document
+---
+
+#Set up
+load packages
+```{r warning=FALSE,message=FALSE}
+library(ggplot2)
+library(limma)
+library(corrplot)
+library(data.table)
+library(tidyverse)
+library(gplots)
+library(BBmisc)
+library(RColorBrewer)
+library(ggsci)
+library(ggpubr)
+library(edgeR)
+library(dplyr)
+library(clusterProfiler)
+library(ggridges)
+library(kableExtra)
+library(rmarkdown)
+library(statmod)
+library(yaml)
+library(ggrepel)
+library(plyr)
+library(pwr)
+library(ggplot2)
+library(ReactomePA)
+```
+
+R set up
+```{r setup, include=FALSE}
+library(knitr)
+library(ggplot2)
+opts_knit$set(root.dir = "Z:\\Maria\\2. Projects\\3. Proteomics\\COVID-19_Proteomics\\2020_10_Covid_6Adults_WesternBuffer\\Data Analysis\\New folder")
+knitr::opts_chunk$set(echo = T, warning = F, message = F, cache = T, error = F, cache.lazy = F)
+```
+
+#Import and filter Maxquant data
+Read in protein file from MaxQuant
+```{r}
+df.prot = read.table("proteinGroups.txt",header=T,sep="\t",stringsAsFactors = F,
+                     comment.char = "",quote ="")
+```
+
+Filter MaxQuant data
+```{r}
+df.prot = df.prot[!df.prot$Reverse=="+",]
+df.prot = df.prot[!df.prot$Potential.contaminant=="+",]
+df.prot = df.prot[!df.prot$Only.identified.by.site=="+",]
+write.table(df.prot,"alldata.txt", sep = "\t", row.names=FALSE)
+
+```
+
+
+Read in alldata.txt after manually normalising TMT labels
+```{r}
+df.prot = read.table("alldata_norm.txt",header=T,sep="\t",stringsAsFactors = F,
+                     comment.char = "",quote ="")
+```
+
+
+
+Isolate columns containing LFQ values and log2 transform
+```{r}
+df.prot = df.prot[!df.prot$Unique.peptides<=1,]
+df.prot.all = df.prot[,59:70]
+rownames(df.prot.all) = df.prot$Fasta.headers
+df.prot.all[df.prot.all==0] <- NA
+write.table(df.prot.all,"alldata_LFQvalues.txt", sep = "\t")
+protein.matrix_all = log2(as.matrix(df.prot.all))
+log2all.df <- as.data.frame(protein.matrix_all)
+write.table(log2all.df,"Log2_alldata2.txt", sep = "\t")
+```
+
+#Intial QC plots on all data before missing value filtering----
+1.Boxplot
+```{r}
+metadata = read.table("MetaData.txt", stringsAsFactors = FALSE,
+                                 header = TRUE, sep = "\t")
+conds = as.factor(metadata$Treatment)
+cond_colours = brewer.pal(length(unique(conds)), "Set1")[as.factor(conds)]
+names(cond_colours) = conds
+boxplot(protein.matrix_all, las=2, col=cond_colours, cex.axis=.3)
+```
+
+2.Pearson correlation
+```{r}
+m_all=cor(protein.matrix_all, use="pairwise.complete.obs")
+corrplot(m_all, type="upper", method="color", cl.lim=c(0.8,1), is.corr=FALSE, tl.col="black", tl.cex=0.5, addCoef.col = "black", number.cex=0.5)
+
+```
+
+
+3.PCA Plot
+```{r}
+metadata = read.table("MetaData.txt", stringsAsFactors = FALSE,
+                                 header = TRUE, sep = "\t")
+conds = as.factor(metadata$Treatment)
+cond_colours = brewer.pal(length(unique(conds)), "Set1")[as.factor(conds)]
+names(cond_colours) = conds
+pca <- princomp(na.omit(protein.matrix_all))
+plot(pca$loadings, col=cond_colours, pch = 19, cex = 2, main = "PCA")
+text(pca$loadings, as.vector(colnames(protein.matrix_all)), pos = 3, cex = 0.6)
+legend("bottomleft", levels(conds), fill = cond_colours[levels(conds)], cex = 0.6)
+```
+
+3b. PCA plot with %
+```{r}
+
+colors <- c("infected"="red", "mock"="blue")
+
+pca_data=prcomp(t(na.omit(protein.matrix_all)))
+pca_data_perc=round(100*pca_data$sdev^2/sum(pca_data$sdev^2),1)
+df_pca_data=data.frame(PC1=pca_data$x[,1], PC2=pca_data$x[,2], sample=colnames(protein.matrix_all), condition = metadata$Treatment)
+find_hull=function(df_pca_data) df_pca_data[chull(df_pca_data$PC1,df_pca_data$PC2),]
+hulls=ddply(df_pca_data, "condition", find_hull)
+
+
+
+PCA<-ggplot(data = df_pca_data, aes(x = PC1, y = PC2, color=condition, fill=condition))+ 
+  geom_point(size=4)+ 
+  labs(title= "PC1 vs. PC2",  x=paste0("PC1(",pca_data_perc[1],"%)"),y=paste0("PC2 (",pca_data_perc[2],"%)")) +
+  theme_bw() +  
+  theme(plot.title = element_text(hjust = 0.5)) +
+  theme(panel.grid.major = element_blank(),
+        panel.grid.minor = element_blank(), axis.line = element_line(colour = "black")) +
+  geom_text_repel(aes(label=metadata$Patient), point.padding = 0.5)+ 
+  scale_color_manual(values=colors)
+
+plot(PCA)
+
+#PCA 
+png('PCA.png')
+plot(PCA)
+dev.off()
+
+```
+
+
+
+
+3c. Batch correction PCA (note the removebatch effects function should not be used for limma analysis of differential expression. It should only be used for PCA/MSD plots).
+
+"It should be pointed out that there is a difference between modelling a batch effect and directly modifying data in order to counteract a batch effect. Programs like ComBat aim to directly modify your data in an attempt to eliminate batch effects (it literally 'subtracts' out the modeled effect, which can result in the infamous negative values after employing ComBat). After employing ComBat, statistical tests are conducted on the modified data, with batch not appearing in the design formula. However, by including 'batch' as a covariate in a design formula for the purpose of differential expression analysis, one is simply modeling the effect size of the batch, without actually modifying your data. The modeled effect size is then taken into account when statistical inferences are made." https://www.biostars.org/p/266507/
+https://rdrr.io/bioc/limma/man/removeBatchEffect.html
+
+```{r}
+#Patient Batch Correction
+batch.patient <- removeBatchEffect(protein.matrix_all, batch = metadata$Patient)
+pca_data_batch=prcomp(t(na.omit(batch.patient)))
+pca_data_batch_perc=round(100*pca_data_batch$sdev^2/sum(pca_data_batch$sdev^2),1)
+df_pca_data_batch=data.frame(PC1=pca_data_batch$x[,1], PC2=pca_data_batch$x[,2], sample=colnames(protein.matrix_all), condition = metadata$Treatment)
+find_hull_batch=function(df_pca_data_batch) df_pca_data_batch[chull(df_pca_data_batch$PC1,df_pca_data_batch$PC2),]
+hulls_batch=ddply(df_pca_data_batch, "condition", find_hull_batch)
+
+
+
+PCA_batch<-ggplot(data = df_pca_data_batch, aes(x = PC1, y = PC2, color=condition, fill=condition))+ 
+  geom_point(size=4)+ 
+  labs(title= "PC1 vs. PC2",  x=paste0("PC1(",pca_data_perc[1],"%)"),y=paste0("PC2 (",pca_data_perc[2],"%)")) +
+  theme_bw() +  
+  theme(plot.title = element_text(hjust = 0.5)) +
+  theme(panel.grid.major = element_blank(),
+        panel.grid.minor = element_blank(), axis.line = element_line(colour = "black")) +
+  geom_text_repel(aes(label=metadata$Patient), point.padding = 0.5)+ 
+  scale_color_manual(values=colors)
+
+plot(PCA_batch)
+
+png('PCA_batchcorrected.png')
+plot(PCA_batch)
+dev.off()
+```
+
+4.Dispersion plot using cpm of LFQ intensities
+Convert NaN to 0 (doesn't seem to like when I keep NaN in)
+
+Biological CV (BCV) is the coefficient of variation with which the (unknown) true abundance of the gene varies between replicate RNA samples. It represents the CV that would remain between biological replicates if sequencing depth could be increased indefinitely. The technical CV decreases as the size of the counts increases. BCV on the other hand does not. BCV is therefore likely to be the dominant source of uncertainty for high-count genes, so reliable estimation of BCV is crucial for realistic assessment of differential expression in RNA-Seq experiments.
+In our proteomics data, the BCV is high for low-abundance proteins (before we filter for valid values). I assume this is bc for these proteins there may be a lot of missing values, and so the biological variation will be very high if a protein is present in some but not all replicates.
+https://www.bioconductor.org/packages/devel/bioc/vignettes/edgeR/inst/doc/edgeRUsersGuide.pdf
+
+```{r}
+df.prot.all[is.na(df.prot.all)] <- 0 
+cpm <- cpm(df.prot.all)
+y <- DGEList(cpm)
+rownames(metadata) <- metadata$Sample
+design_cpm <- model.matrix(~0+Treatment, data = metadata)
+y <- estimateDisp(y, design_cpm)
+plotBCV(y)
+
+```
+
+5. Multiscatter plot
+```{r, fig.height=13, fig.width=13}
+
+
+# Correlation panel - can define the correlation panel separately and then use it as lower.panel=panel.cor
+#panel.cor <- function(x, y){
+    #usr <- par("usr"); on.exit(par(usr))
+    #par(usr = c(0, 1, 0, 1))
+    #r <- round(cor(x, y), digits=2)
+    #txt <- paste0("R = ", r)
+    #cex.cor <- 0.8/strwidth(txt)
+    #text(0.5, 0.5, txt, cex = cex.cor * r)}
+
+# Customize upper panel - can customise upper panel to only contain the points and not the pearson correlation
+#upper.panel<-function(x, y){
+ # points(x,y, pch = '.')}
+
+upper.panel<-function(x, y){
+  points(x,y, pch='.')
+  r <- round(cor(x, y), digits=2)
+  txt <- paste0("R = ", r)
+  usr <- par("usr"); on.exit(par(usr))
+  par(usr = c(0, 1, 0, 1))
+  text(0.5, 0.9, txt)
+  cex.cor <- 0.6/strwidth(txt)}
+
+panel.hist <- function(x, ...)
+{
+  usr <- par("usr"); on.exit(par(usr))
+  par(usr = c(usr[1:2], 0, 1.5) )
+  h <- hist(x, plot = FALSE)
+  breaks <- h$breaks; nB <- length(breaks)
+  y <- h$counts; y <- y/max(y)
+  rect(breaks[-nB], 0, breaks[-1], y, col="cyan", ...)
+}
+
+# Create the plots
+pairs(na.omit(log2all.df),
+      lower.panel = NULL,
+      upper.panel = upper.panel, diag.panel=panel.hist)
+
+#Option 2 from pysch package
+#pairs.panels(na.omit(log2all.df), 
+             #pch = '.', #changes plot character from a circle to a full stop for cleaner graph
+             #method = "pearson", # correlation method
+             #hist.col = "#00AFBB", 
+             #density = FALSE, #show/hide density plots
+             #ellipses = FALSE, # show/hide correlation ellipses
+            # lm = TRUE)
+```
+
+#Data analysis with Limma- control vs combo vs lipid
+Convert 0 back to NaNs for rest of analysis
+```{r}
+df.prot.all[df.prot.all==0] <- NA
+```
+
+Count number of NaNs for each protein
+```{r}
+log2all.df$na_count_infected = apply(log2all.df,1,function(x) sum(is.na(x[c(2,4,6,8,10,12)])))
+log2all.df$na_count_mock = apply(log2all.df,1,function(x) sum(is.na(x[c(1,3,5,7,9,11)])))
+
+```
+
+Filter protein table for minimum of three valid values in each group
+```{r}
+log2all.df.filter = log2all.df[log2all.df$na_count_mock<=2 & log2all.df$na_count_infected<=2,1:12]
+setDT(log2all.df.filter, keep.rownames ="Fasta.headers")
+write.table(log2all.df.filter,"Filter_protein_list_min3validvalues_eachGroup.txt", sep = "\t", row.names=FALSE)
+log2all.df.filter = log2all.df[log2all.df$na_count_mock<=2 & log2all.df$na_count_infected<=2,1:12]
+```
+
+#Re-do all QC plots on filtered data
+```{r, fig.height=13, fig.width=13}
+boxplot(log2all.df.filter, col=cond_colours, las=2, cex.axis=.5)
+
+m_filtered=cor(log2all.df.filter, use="pairwise.complete.obs")
+corrplot(m_filtered, type="upper", method="color", cl.lim=c(0.8,1), is.corr=FALSE, tl.col="black", tl.cex=0.8, addCoef.col = "black", number.cex=0.60)
+
+upper.panel<-function(x, y){
+  points(x,y, pch='.')
+  r <- round(cor(x, y), digits=2)
+  txt <- paste0("R = ", r)
+  usr <- par("usr"); on.exit(par(usr))
+  par(usr = c(0, 1, 0, 1))
+  text(0.5, 0.9, txt)
+  cex.cor <- 0.6/strwidth(txt)}
+
+panel.hist <- function(x, ...)
+{
+  usr <- par("usr"); on.exit(par(usr))
+  par(usr = c(usr[1:2], 0, 1.5) )
+  h <- hist(x, plot = FALSE)
+  breaks <- h$breaks; nB <- length(breaks)
+  y <- h$counts; y <- y/max(y)
+  rect(breaks[-nB], 0, breaks[-1], y, col="cyan", ...)
+}
+
+# Create the plots
+pairs(na.omit(log2all.df.filter),
+      lower.panel = NULL,
+      upper.panel = upper.panel, diag.panel=panel.hist)
+
+#make sure to use non-log2 transformed data here
+df.prot.all$na_count_infected = apply(df.prot.all,1,function(x) sum(is.na(x[c(2,4,6,8,10,12)])))
+df.prot.all$na_count_mock = apply(df.prot.all,1,function(x) sum(is.na(x[c(1,3,5,7,9,11)])))
+df.prot.all.filter = df.prot.all[df.prot.all$na_count_mock<=2 & df.prot.all$na_count_infected<=2, 1:12]
+df.prot.all.filter[is.na(df.prot.all.filter)] <- 0
+df.prot.all.filter1 = df.prot.all.filter
+df.prot.all.filter1 = setDT(df.prot.all.filter1, keep.rownames ="Fasta.headers")
+write.table(df.prot.all.filter1,"Filter_protein_list_min3validvalues_eachGroup_non-log2.txt", sep = "\t", row.names=FALSE)
+
+
+
+
+cpm <- cpm(df.prot.all.filter)
+y <- DGEList(cpm)
+
+
+rownames(metadata) <- metadata$Sample
+design_cpm <- model.matrix(~0+Treatment, data = metadata)
+y <- estimateDisp(y, design_cpm)
+plotBCV(y)
+```
+
+#Set experimental design with patient pairing
+Batch correction within linear model using duplicate correlation to account for the fact we have patients with triplicate samples----
+Here we tell the model that we have three samples per patient to account for the biological variation coming from the patients rather than including this as a batch in the linear model
+We do this bc we want this paired analysis- if not paired then patient wouldn't be a factor we would need a batch effect for!
+Could include sex and age (binned as old and young) in the model too by using design = model.matrix(~0+Treatment+gender+age, data=metadata)
+
+See https://stat.ethz.ch/pipermail/bioconductor/2005-March/007864.html and https://support.bioconductor.org/p/12958/ for info on using duplicatecorrelation for biological samples
+
+#Create groups column (Condition_BioReplicate) 
+create a new column merging information of treatment and group (i.e. Control 1, Control 2, Control 3, TGF1, TGF2, etc)
+```{r}
+merge_SexTreatment <- paste0(metadata$Sex,metadata$Treatment)
+metadata$Class <- as.factor(metadata$Treatment)
+```
+
+
+
+
+```{r}
+design_paired = model.matrix(~0+Class, data=metadata)# fitting without intercept
+corfit=duplicateCorrelation(log2all.df.filter,block = metadata$Patient, design= design_paired)
+
+```
+
+Limma with paired analysis
+```{r}
+fit1_paired = lmFit(log2all.df.filter,design = design_paired, block = metadata$Patient, correlation = corfit$consensus)
+cont_paired <- makeContrasts(Classinfected-Classmock, levels = design_paired)
+fit2_paired = contrasts.fit(fit1_paired,contrasts = cont_paired)
+fit3_paired <- eBayes(fit2_paired)
+finalresult_paired <- topTable(fit3_paired, adjust.method = "BH", number = Inf)
+
+#Adults
+finalresult_Adults_paired <- topTable(fit3_paired, coef =1, adjust.method = "BH", number = Inf)
+setDT(finalresult_Adults_paired, keep.rownames ="Fasta.headers")
+names(finalresult_Adults_paired)[1]<-"Fasta.headers"
+merged_finalresult_Adults_paired <- merge(finalresult_Adults_paired,df.prot,by="Fasta.headers")
+write.table(merged_finalresult_Adults_paired,"merged_finalresult_Adults_paired.txt",sep = "\t",
+            row.names = F,quote=F)
+
+#kableExtra::kable(finalresult_Adult_paired, digits = 1000) %>% kable_styling() %>% scroll_box(width = "1000px", height = "500px")
+
+#Child
+#finalresult_Child_paired <- topTable(fit3_paired, coef =2, adjust.method = "BH", number = Inf)
+#setDT(finalresult_Child_paired, keep.rownames ="Fasta.headers")
+#names(finalresult_Child_paired)[1]<-"Fasta.headers"
+#merged_finalresult_Child_paired <- merge(finalresult_Child_paired,df.prot,by="Fasta.headers")
+#write.table(merged_finalresult_Child_paired,"merged_finalresult_Child_paired.txt",sep = "\t",
+#            row.names = F,quote=F)
+
+#Treatment
+#design_paired2 = model.matrix(~0+Treatment, data=metadata)# fitting without intercept
+#corfit2=duplicateCorrelation(log2all.df.filter,block = metadata$Patient, design= design_paired)
+
+#fit1_paired2 = lmFit(log2all.df.filter,design = design_paired2, block = metadata$Patient, correlation = corfit2$consensus)
+#cont_paired2 <- makeContrasts(TreatmentInfected-TreatmentMock, levels = design_paired2)
+#fit2_paired2 = contrasts.fit(fit1_paired2,contrasts = cont_paired2)
+#fit3_paired2 <- eBayes(fit2_paired2)
+#finalresult_paired2 <- topTable(fit3_paired2, adjust.method = "BH", number = Inf)
+
+
+#finalresult_Treatment_paired <- topTable(fit3_paired2, coef =1, adjust.method = "BH", number = Inf)
+#setDT(finalresult_Treatment_paired, keep.rownames ="Fasta.headers")
+#names(finalresult_Treatment_paired)[1]<-"Fasta.headers"
+#merged_finalresult_Treatment_paired <- merge(finalresult_Treatment_paired,df.prot,by="Fasta.headers")
+#write.table(merged_finalresult_Treatment_paired,"merged_finalresult_Treatment_paired.txt",sep = "\t",
+      #      row.names = F,quote=F)
+
+```
+#Volcano
+#Adult
+1.volcano plot Adults
+```{r}
+finalresult_Adults_paired$log.P.Value = -log10(finalresult_Adults_paired$P.Value)
+finalresult_Adults_paired$threshold = ifelse(finalresult_Adults_paired$logFC > .585 & finalresult_Adults_paired$log.P.Value > 1.3, "sig increased", ifelse(finalresult_Adults_paired$logFC < -0.585 & finalresult_Adults_paired$log.P.Value > 1.3, "sig decreased", "not significant"))
+volcano_adult_paired=ggplot(data=finalresult_Adults_paired, aes(x=logFC, y=log.P.Value, colour=threshold)) + geom_point() +theme_classic()+ xlab("Log2 fold change") + ylab("-Log10 p-value") 
+volcano_adult_paired <-volcano_adult_paired + geom_vline(xintercept = 0.585, linetype="dashed", 
+                color = "black", size=0.5)
+volcano_adult_paired <-volcano_adult_paired + geom_vline(xintercept = -0.585, linetype="dashed", 
+                     color = "black", size=0.5) 
+
+
+
+volcano_adult_paired <-volcano_adult_paired + scale_color_manual(values = c("#000000", "#0000FF", "#FF9900"))
+volcano_adult_paired
+
+png('volcano_adult_paired.png')
+plot(volcano_adult_paired)
+dev.off()
+
+#adj p value
+
+
+finalresult_Adults_paired$log.adj.P.Val = -log10(finalresult_Adults_paired$adj.P.Val)
+finalresult_Adults_paired$threshold = ifelse(finalresult_Adults_paired$logFC > .585 & finalresult_Adults_paired$log.adj.P.Val > 1.3, "sig increased", ifelse(finalresult_Adults_paired$logFC < -0.585 & finalresult_Adults_paired$log.adj.P.Val > 1.3, "sig decreased", "not significant"))
+volcano_adult_paired_adj=ggplot(data=finalresult_Adults_paired, aes(x=logFC, y=log.adj.P.Val, colour=threshold)) + geom_point() +theme_classic()+ xlab("Log2 fold change") + ylab("-Log10 adj p-value") 
+volcano_adult_paired_adj <-volcano_adult_paired_adj + geom_vline(xintercept = 0.585, linetype="dashed", 
+                color = "black", size=0.5)
+volcano_adult_paired_adj <-volcano_adult_paired_adj + geom_vline(xintercept = -0.585, linetype="dashed", 
+                     color = "black", size=0.5) 
+volcano_adult_paired_adj <-volcano_adult_paired_adj + scale_color_manual(values = c("#000000",  "#0000FF", "#FF9900"))
+volcano_adult_paired_adj
+
+png('volcano_adult_paired_adj.png')
+plot(volcano_adult_paired_adj)
+
+
+merged_finalresult_Adults_paired <- merge(finalresult_Adults_paired,df.prot,by="Fasta.headers")
+write.table(merged_finalresult_Adults_paired,"merged_finalresult_Adults_paired_wthres.txt",sep = "\t",
+            row.names = F,quote=F)
+
+dev.off()
+```
+
+
+
+#Heatmap
+
+2.Heatmap Adult
+```{r}
+sig_adults_paired=rownames(finalresult_Adults_paired[ (finalresult_Adults_paired$adj.P.Val <0.05) , ])
+summary(sig_adults_paired)
+heatmap_finalresult_Adults_paired <- finalresult_Adults_paired[finalresult_Adults_paired$adj.P.Val<0.05]
+setDT(heatmap_finalresult_Adults_paired, keep.rownames ="Fasta.headers")
+merged_heatmap_finalresult_Adults_paired <- merge(heatmap_finalresult_Adults_paired,df.prot,by="Fasta.headers")
+heatmap_sigproteins_Adults_paired <- merged_heatmap_finalresult_Adults_paired[,c(1,68,69, 70, 71, 72, 73, 74, 75, 76, 77, 78, 79)]
+heatmap_sigproteins_Adults_paired <- data.frame(heatmap_sigproteins_Adults_paired, row.names=1)
+heatmap_sigproteins_Adults_paired[heatmap_sigproteins_Adults_paired==0] <- NA
+protein.matrix_heatmap_sigproteins_Adults_paired = log2(as.matrix(heatmap_sigproteins_Adults_paired))
+heatmap.2(protein.matrix_heatmap_sigproteins_Adults_paired, density.info="none",
+          trace="none", margins=c(10,7))
+colors <- colorRampPalette(c("purple", "white", "orange"))(64)
+heatmap.2(protein.matrix_heatmap_sigproteins_Adults_paired, scale ="row", col=colors, density.info="none",
+          trace="none", margins=c(10,7))
+```
+
+
+
+
+
+Get the gene set table for MSigDB Hallmark Gene Set
+```{r}
+gmt = read.gmt("h.all.v7.0.symbols.gmt")
+gmt$ont = gsub("HALLMARK_", "", gmt$ont)
+```
+
+3. GSEA control vs combo paired
+```{r}
+genelist_combo_paired = read.table("Gene_name_FC_removeDup.txt",header=T,sep="\t",stringsAsFactors = F,
+                     comment.char = "",quote ="")
+#genelist_combo_paired <- merged_finalresult_Adults_paired[,c(17,2)]
+genelist1_combo_paired = pull(genelist_combo_paired,logFC)
+names(genelist1_combo_paired) = pull(genelist_combo_paired, Gene.names)
+genelist1_combo_paired = sort(genelist1_combo_paired, decreasing = TRUE)
+gsea_combo_paired = GSEA(geneList = genelist1_combo_paired,
+            exponent = 1,
+            nPerm = 10000,
+            minGSSize = 2,
+            maxGSSize = 500,
+            pvalueCutoff = 0.05,
+            pAdjustMethod = "BH",
+            TERM2GENE = gmt, 
+            by = "fgsea")
+dotplot(gsea_combo_paired)
+y <- ridgeplot(gsea_combo_paired)
+y <- y+ scale_fill_material("orange")
+
+png('gsea_combo_paired.png')
+plot(y)
+dev.off()
+```
+
+4. cnetplot 
+The cnetplot depicts the linkages of genes and biological concepts (e.g. GO terms or KEGG pathways) as a network (helpful to see which genes are involved in enriched pathways and genes that may belong to multiple annotation categories). Note! Check the categorysize parameter bc it doesn't seem to be working (ie numbers don't change regardless of what I set category size equal to!
+
+```{r, fig.height=7, fig.width=12}
+cnetplot(gsea_combo_paired, categorySize="pvalue", foldChange=genelist1_combo_paired, showCategory = 4) + scale_color_gradient2(low="blue", mid="white", high="orange", name="Fold change")
+```
+
+5. GO enrichment
+Perform on just differentially expressed proteins
+```{r}
+#BiocManager::install("org.Hs.eg.db")
+orgnsm_human = "org.Hs.eg.db"
+library(orgnsm_human, character.only = TRUE)
+
+#CODE FOR GO ENRICHMENT ANALYSIS
+
+#ALL
+Uniprot_combo_paired_sig <- merged_finalresult_Adults_paired[,c(9,2,5)]
+Uniprot_combo_paired_sig <- Uniprot_combo_paired_sig[Uniprot_combo_paired_sig$P.Value<0.05]
+Uniprot_combo_paired_sig <- Uniprot_combo_paired_sig$Majority.protein.IDs
+Uniprot_combo_paired_sig <- clusterProfiler::bitr(Uniprot_combo_paired_sig, fromType = "UNIPROT", 
+                                 toType = "ENTREZID",
+                                 OrgDb = orgnsm_human)
+
+#Sig increased
+Uniprot_combo_paired_sig_up <- merged_finalresult_Adults_paired[,c(9,2,5)]
+Uniprot_combo_paired_sig_up <- Uniprot_combo_paired_sig_up[Uniprot_combo_paired_sig_up$P.Value<0.05]
+Uniprot_combo_paired_sig_up <- Uniprot_combo_paired_sig_up[Uniprot_combo_paired_sig_up$logFC>0]
+Uniprot_combo_paired_sig_up <- Uniprot_combo_paired_sig_up$Majority.protein.IDs
+Uniprot_combo_paired_sig_up <- clusterProfiler::bitr(Uniprot_combo_paired_sig_up, fromType = "UNIPROT", 
+                                 toType = "ENTREZID",
+                                 OrgDb = orgnsm_human)
+
+#Cellular component
+go.enrich.cc <- enrichGO(gene = Uniprot_combo_paired_sig_up$ENTREZID,
+                         OrgDb = orgnsm_human,
+                         keyType = 'ENTREZID',
+                         ont = "CC",
+                         pAdjustMethod = "BH",
+                         pvalueCutoff = 0.01,
+                         qvalueCutoff  = 0.01)
+
+barplot(go.enrich.cc, showCategory=10) + scale_fill_material("orange")
+
+#Biological Process
+go.enrich.bp.up <- enrichGO(gene = Uniprot_combo_paired_sig_up$ENTREZID,
+                         OrgDb = orgnsm_human,
+                         keyType = 'ENTREZID',
+                         ont = "BP",
+                         pAdjustMethod = "BH",
+                         pvalueCutoff = 0.01,
+                         qvalueCutoff  = 0.01)
+
+barplot(go.enrich.bp.up, showCategory=10) + scale_fill_material("orange")
+
+#Molecular Function
+go.enrich.mf.up <- enrichGO(gene = Uniprot_combo_paired_sig_up$ENTREZID,
+                         OrgDb = orgnsm_human,
+                         keyType = 'ENTREZID',
+                         ont = "MF",
+                         pAdjustMethod = "BH",
+                         pvalueCutoff = 0.01,
+                         qvalueCutoff  = 0.01)
+
+barplot(go.enrich.mf.up, showCategory=10) + scale_fill_material("orange")
+
+
+#sig decreased
+Uniprot_combo_paired_sig_down <- merged_finalresult_Adults_paired[,c(9,2,5)]
+Uniprot_combo_paired_sig_down <- Uniprot_combo_paired_sig_down[Uniprot_combo_paired_sig_down$P.Value<0.05]
+Uniprot_combo_paired_sig_down <- Uniprot_combo_paired_sig_down[Uniprot_combo_paired_sig_down$logFC<0]
+Uniprot_combo_paired_sig_down <- Uniprot_combo_paired_sig_down$Majority.protein.IDs
+Uniprot_combo_paired_sig_down <- clusterProfiler::bitr(Uniprot_combo_paired_sig_down, fromType = "UNIPROT", 
+                                 toType = "ENTREZID",
+                                 OrgDb = orgnsm_human)
+
+
+#Cellular component
+go.enrich.cc.down <- enrichGO(gene = Uniprot_combo_paired_sig_down$ENTREZID,
+                         OrgDb = orgnsm_human,
+                         keyType = 'ENTREZID',
+                         ont = "CC",
+                         pAdjustMethod = "BH",
+                         pvalueCutoff = 0.01,
+                         qvalueCutoff  = 0.01)
+
+barplot(go.enrich.cc.down, showCategory=10) + scale_fill_material("blue")
+
+#Biological Process
+go.enrich.bp.down <- enrichGO(gene = Uniprot_combo_paired_sig_down$ENTREZID,
+                         OrgDb = orgnsm_human,
+                         keyType = 'ENTREZID',
+                         ont = "BP",
+                         pAdjustMethod = "BH",
+                         pvalueCutoff = 0.01,
+                         qvalueCutoff  = 0.01)
+
+barplot(go.enrich.bp.down, showCategory=10) + scale_fill_material("blue")
+
+#Molecular Function
+go.enrich.mf.down <- enrichGO(gene = Uniprot_combo_paired_sig_down$ENTREZID,
+                         OrgDb = orgnsm_human,
+                         keyType = 'ENTREZID',
+                         ont = "MF",
+                         pAdjustMethod = "BH",
+                         pvalueCutoff = 0.01,
+                         qvalueCutoff  = 0.01)
+
+barplot(go.enrich.mf.down, showCategory=10) + scale_fill_material("blue")
+```
+
+6. Reactome
+```{r}
+#All
+pathway.enrichment <- enrichPathway(Uniprot_combo_paired_sig$ENTREZID,pvalueCutoff=0.01, readable=T,
+                                    organism = "human", pAdjustMethod="BH",
+                                    qvalueCutoff = 0.01)
+
+head(as.data.frame(pathway.enrichment))
+
+#Visualize enrichment result
+barplot(pathway.enrichment, showCategory=10, orderBy = "p.adjust") + scale_fill_material("orange")
+
+#Sig Increased
+pathway.enrichment <- enrichPathway(Uniprot_combo_paired_sig_up$ENTREZID,pvalueCutoff=0.01, readable=T,
+                                    organism = "human", pAdjustMethod="BH",
+                                    qvalueCutoff = 0.01)
+
+head(as.data.frame(pathway.enrichment))
+
+#Visualize enrichment result
+barplot(pathway.enrichment, showCategory=10, orderBy = "p.adjust") + scale_fill_material("orange")
+
+#Sig Decreased
+pathway.enrichment <- enrichPathway(Uniprot_combo_paired_sig_down$ENTREZID,pvalueCutoff=0.01, readable=T,
+                                    organism = "human", pAdjustMethod="BH",
+                                    qvalueCutoff = 0.01)
+
+head(as.data.frame(pathway.enrichment))
+
+#Visualize enrichment result
+barplot(pathway.enrichment, showCategory=10, orderBy = "p.adjust") + scale_fill_material("blue")
+
+```
+
+
+#Child
+1.volcano plot lipid vs control
+```{r}
+#kableExtra::kable(finalresult_Child_paired, digits = 1000) %>% kable_styling() %>% scroll_box(width = "1000px", height = "500px")
+
+finalresult_Child_paired$log.P.Value = -log10(finalresult_Child_paired$P.Value)
+finalresult_Child_paired$threshold = ifelse(finalresult_Child_paired$logFC > .0001 & finalresult_Child_paired$P.Value < 0.05, "sig increased", ifelse(finalresult_Child_paired$logFC < -0.001 & finalresult_Child_paired$P.Value < 0.05, "sig decreased", "not significant"))
+volcano_lipid_paired=ggplot(data=finalresult_Child_paired, aes(x=logFC, y=log.P.Value, colour=threshold)) + geom_point() +theme_classic()+ xlab("Log2 fold change") + ylab("-Log10 p-value") 
+volcano_lipid_paired <-volcano_lipid_paired + geom_vline(xintercept = 1, linetype="dashed", 
+                color = "black", size=0.5)
+volcano_lipid_paired <-volcano_lipid_paired + geom_vline(xintercept = -1, linetype="dashed", 
+                     color = "black", size=0.5) + ylim(0,7)
+volcano_lipid_paired <-volcano_lipid_paired + scale_color_manual(values = c("#000000", "#0000FF", "#FF9900")) + scale_y_continuous(breaks=seq(0,5.5,1))
+volcano_lipid_paired
+
+png('volcano_lipid_paired.png')
+plot(volcano_lipid_paired)
+dev.off()
+
+
+#adj p value
+finalresult_Child_paired$log.P.Value = -log10(finalresult_Child_paired$P.Value)
+finalresult_Child_paired$threshold = ifelse(finalresult_Child_paired$logFC > .0001 & finalresult_Child_paired$adj.P.Val < 0.1, "sig increased", ifelse(finalresult_Child_paired$logFC < -0.001 & finalresult_Child_paired$adj.P.Val < 0.1, "sig decreased", "not significant"))
+volcano_lipid_paired=ggplot(data=finalresult_Child_paired, aes(x=logFC, y=log.P.Value, colour=threshold)) + geom_point() +theme_classic()+ xlab("Log2 fold change") + ylab("-Log10 p-value") 
+volcano_lipid_paired <-volcano_lipid_paired + geom_vline(xintercept = 1, linetype="dashed", 
+                color = "black", size=0.5)
+volcano_lipid_paired <-volcano_lipid_paired + geom_vline(xintercept = -1, linetype="dashed", 
+                     color = "black", size=0.5) + ylim(0,7)
+volcano_lipid_paired <-volcano_lipid_paired + scale_color_manual(values = c("#000000", "#FF9900", "#0000FF")) + scale_y_continuous(breaks=seq(0,5.5,1))
+volcano_lipid_paired
+
+
+png('volcano_lipid_paired_padj.png')
+plot(volcano_lipid_paired)
+dev.off()
+```
+
+2.Heatmap lipid vs control
+```{r}
+sig_lipid_paired=rownames(finalresult_Child_paired[ (finalresult_Child_paired$P.Value <0.05) , ])
+summary(sig_lipid_paired)
+heatmap_finalresult_Child_paired <- finalresult_Child_paired[finalresult_Child_paired$P.Value<0.05]
+setDT(heatmap_finalresult_Child_paired, keep.rownames ="Fasta.headers")
+merged_heatmap_finalresult_Child_paired <- merge(heatmap_finalresult_Child_paired,df.prot,by="Fasta.headers")
+heatmap_sigproteins_Child_paired <- merged_heatmap_finalresult_Child_paired[,c(16, 137,138,140,141,143,144,146,147,149,150)]
+heatmap_sigproteins_Child_paired <- data.frame(heatmap_sigproteins_Child_paired, row.names=1)
+heatmap_sigproteins_Child_paired[heatmap_sigproteins_Child_paired==0] <- NA
+protein.matrix_heatmap_sigproteins_Child_paired = log2(as.matrix(heatmap_sigproteins_Child_paired))
+heatmap.2(protein.matrix_heatmap_sigproteins_Child_paired, density.info="none",
+          trace="none", margins=c(10,7))
+colors <- colorRampPalette(c("purple", "white", "orange"))(64)
+heatmap.2(protein.matrix_heatmap_sigproteins_Child_paired, scale ="row", col=colors, density.info="none",
+          trace="none", margins=c(10,7))
+```
+
+3. GSEA control vs lipid paired
+```{r}
+genelist_lipid_paired <- merged_finalresult_Child_paired[,c(14,2)]
+genelist1_lipid_paired = pull(genelist_lipid_paired,logFC)
+names(genelist1_lipid_paired) = pull(genelist_lipid_paired, Gene.names)
+genelist1_lipid_paired = sort(genelist1_lipid_paired, decreasing = TRUE)
+gsea_lipid_paired = GSEA(geneList = genelist1_lipid_paired,
+            exponent = 1,
+            nPerm = 10000,
+            minGSSize = 5,
+            maxGSSize = 500,
+            pvalueCutoff = 0.05,
+            pAdjustMethod = "BH",
+            TERM2GENE = gmt, 
+            by = "fgsea")
+dotplot(gsea_lipid_paired)
+y <- ridgeplot(gsea_lipid_paired)
+y<-y + scale_fill_material("orange")
+y
+
+png('gsea_lipid_paired.png')
+plot(y)
+dev.off()
+```
+
+4.cnetplot
+```{r, fig.height=7, fig.width=10}
+cnetplot(gsea_lipid_paired, categorySize="pvalue", foldChange=genelist1_lipid_paired, showCategory = 3) + scale_color_gradient2(low="blue", mid="white", high="orange", name="Fold change")
+```
+
+#p value histogram plot
+combo vs control no correction
+also see http://varianceexplained.org/statistics/interpreting-pvalue-histogram/ 
+
+p value histogram plot
+```{r}
+hist(finalresult_Adults_paired$P.Value)
+```
+
+p value histogram plot
+control vs lipid
+```{r}
+hist(finalresult_Child_paired$P.Value)
+```
+LogFC histogram plot
+control vs combo
+```{r}
+hist(finalresult_Adults_paired$logFC)
+```
+LogFC histogram plot
+control vs lipid
+```{r}
+hist(finalresult_Child_paired$logFC)
+```
+
+Unique peptide histogram
+```{r}
+hist(df.prot$Unique.peptides, freq=FALSE, col="lightblue", breaks =128) #freq=false changes y axis from frequency to density, useful if you want to compare two or more histograms with diff sample sizes, bc frequency is relative to sample size, density is not)
+```
+#Power analysis 
+Note the effect size is just the standardised mean difference between the two groups. In other words:
+effect size = ([mean of experimental group] - [mean of control group])/standard deviation
+                                
+A d of 1 indicates the two groups differ by 1 standard deviation, a d of 2 indicates they differ by 2 standard deviations, and so on. Standard deviations are equivalent to z-scores (1 standard deviation = 1 z-score).
+Cohen suggested that d=0.2 be considered a 'small' effect size, 0.5 represents a 'medium' effect size and 0.8 a 'large' effect size. This means that if two groups' means don't differ by 0.2 standard deviations or more, the difference is trivial, even if it is statistically significant. 
+https://www.leeds.ac.uk/educol/documents/00002182.htm
+
+The d calculated below is Cohen's d. Cohen's d is the effect size, here by using log2(2) we have basically said that the difference between groups is 1 (b/c in Cohen's d cal, the numerator is [mean of experimental group] - [mean of control group] ) ie this represents our FC cut-off. So here we are calculating how many samples we would need to be able to detect a FC of 1 between samples given the noise of our preliminary data (pooled standard deviation)
+
+We can also find out how many samples we would need to achieve a medium or large effect! I assume that we can just set d=0.2, 0.5 or 1 to see how many samples we would need to be able to detect "small", "medium" or "large" effects, but then you aren't taking into account the "noise" from your data which we do get by calculating d ourselves using sd(as.matrix(na.omit(log2all.df.filter))) as the denominator in the cohen's d calc. Setting the d manually (ie as 0.2, 0.5 or 1) is only recommended when you can't do a pilot study, though meta-analysis of over 10,000 studies showed the average effect size is 0.5
+
+https://stats.idre.ucla.edu/other/mult-pkg/seminars/intro-power/
+http://www.3rs-reduction.co.uk/html/6__power_and_sample_size.html
+
+```{r}
+#Option 1
+#using voom as suggested by Peter, but we don't use voom in our data analysis so probably not the best way to do the power analysis
+cpm <- cpm(df.prot.all.filter)
+y <- DGEList(cpm)
+y <- calcNormFactors(y)
+metadata = read.table("MetaData.txt", stringsAsFactors = FALSE,
+                      header = TRUE, sep = "\t")
+rownames(metadata) <- metadata$Sample
+corfit=duplicateCorrelation(df.prot.all.filter,block = metadata$Batch) 
+design_paired = model.matrix(~0+Treatment, data=metadata)
+y <- estimateDisp(y, design_paired)
+v <- voom(y, design_paired)
+v.df <- as.data.frame(v)
+d_voom <- log2(2)/sd(as.matrix(v.df))
+n <- min(table(as.factor(metadata$Treatment)))
+
+#Then do calcualtions as below but with d=d_voom
+
+#Option 2
+#Use the log2 transformed filter data that we used for the actual data analysis for the calculation of the effect size instead of voom (here we need to omit Na values otherwise it calculates an Na effect size)
+
+d <- log2(2)/sd(as.matrix(na.omit(log2all.df.filter))) 
+n <- min(table(as.factor(metadata$Treatment)))
+
+
+#do power calculations with type=paired bc our samples are paired (ie control, combo and lipid treatment for each patient)
+p1_paired <- pwr.t.test(d = d, sig.level = 0.05, power = 0.8, alternative = "two.sided", type = "paired") 
+plot(p1_paired)
+p1_paired
+
+# shows the effect size required with the given n 
+p2_paired <- pwr.t.test(n = n, sig.level = 0.05, power = 0.8, alternative = "two.sided", type = "paired")
+plot(p2_paired)
+p2_paired
+
+# power that you have with the d and n given 
+p3_paired <- pwr.t.test(n = n, d = d, sig.level = 0.05, alternative = "two.sided", type = "paired")
+plot(p3_paired)
+p3_paired
+```

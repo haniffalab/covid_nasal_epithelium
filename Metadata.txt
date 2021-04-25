@@ -1,0 +1,13 @@
+Sample	Status	Patient	Treatment	Sex	Age
+Reporter.intensity.corrected.NORM.4.1	NM60-	NM60	mock	Male	78
+Reporter.intensity.corrected.NORM.5.1	NM60+	NM60	infected	Male	78
+Reporter.intensity.corrected.NORM.6.1	NMAJ-	NMAJ	mock	Male	41
+Reporter.intensity.corrected.NORM.7.1	NMAJ+	NMAJ	infected	Male	41
+Reporter.intensity.corrected.NORM.8.1	NM42-	NM42	mock	Female	46
+Reporter.intensity.corrected.NORM.9.1	NM42+	NM42	infected	Female	46
+Reporter.intensity.corrected.NORM.10.1	NM50-	NM50	mock	Female	38
+Reporter.intensity.corrected.NORM.11.1	NM50+	NM50	infected	Female	38
+Reporter.intensity.corrected.NORM.12.1	NP55-	NP55	mock	Male	68
+Reporter.intensity.corrected.NORM.13.1	NP55+	NP55	infected	Male	68
+Reporter.intensity.corrected.NORM.14.1	NPAA-	NPAA	mock	Female	54
+Reporter.intensity.corrected.NORM.15.1	NPAA+	NPAA	infected	Female	54
